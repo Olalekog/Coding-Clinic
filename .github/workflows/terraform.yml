@@ -1,0 +1,287 @@
+name: Terraform VPC
+
+# dev  - applied on every push to the dev branch.
+# uat  - planned on a pull request from dev into uat, applied when it merges.
+# prod - planned on a pull request from uat into prod; after the merge the
+#        apply waits for a reviewer to approve the "prod" GitHub environment.
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - "environments/**"
+      - "Module/**"
+      - ".github/workflows/terraform.yml"
+
+  pull_request:
+    branches:
+      - uat
+      - prod
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - closed
+    paths:
+      - "environments/**"
+      - "Module/**"
+      - ".github/workflows/terraform.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-${{ github.base_ref || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ROLE_TO_ASSUME: ${{ vars.ROLE_TO_ASSUME }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TERRAFORM_VERSION: ${{ vars.TERRAFORM_VERSION || '1.10.4' }}
+  PROJECT_NAME: coding-clinic-vpc
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  resolve-context:
+    name: Resolve deployment context
+    runs-on: ubuntu-latest
+
+    outputs:
+      environment: ${{ steps.context.outputs.environment }}
+      should_plan: ${{ steps.context.outputs.should_plan }}
+      should_apply: ${{ steps.context.outputs.should_apply }}
+
+    steps:
+      - name: Resolve environment and operation
+        id: context
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          SOURCE_BRANCH: ${{ github.head_ref }}
+          TARGET_BRANCH: ${{ github.base_ref }}
+          PR_MERGED: ${{ github.event.pull_request.merged || false }}
+        run: |
+          set -euo pipefail
+
+          environment=""
+          should_plan="false"
+          should_apply="false"
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            environment="dev"
+            should_plan="true"
+            should_apply="true"
+
+          elif [[ "$EVENT_ACTION" == "closed" && "$PR_MERGED" != "true" ]]; then
+            echo "Pull request was closed without merging. Nothing to do."
+            environment="$TARGET_BRANCH"
+
+          else
+            case "${SOURCE_BRANCH}:${TARGET_BRANCH}" in
+              dev:uat)
+                environment="uat"
+                ;;
+              uat:prod)
+                environment="prod"
+                ;;
+              *)
+                echo "::error::Invalid promotion path: ${SOURCE_BRANCH} -> ${TARGET_BRANCH}. Allowed paths are dev -> uat and uat -> prod."
+                exit 1
+                ;;
+            esac
+
+            should_plan="true"
+
+            if [[ "$EVENT_ACTION" == "closed" ]]; then
+              should_apply="true"
+            fi
+          fi
+
+          {
+            echo "environment=$environment"
+            echo "should_plan=$should_plan"
+            echo "should_apply=$should_apply"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Terraform workflow context"
+            echo
+            echo "- Environment: \`$environment\`"
+            echo "- Plan: \`$should_plan\`"
+            echo "- Apply: \`$should_apply\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  terraform-plan:
+    name: Terraform plan - ${{ needs.resolve-context.outputs.environment }}
+    runs-on: ubuntu-latest
+
+    needs:
+      - resolve-context
+
+    if: ${{ needs.resolve-context.outputs.should_plan == 'true' }}
+
+    env:
+      TF_ENVIRONMENT: ${{ needs.resolve-context.outputs.environment }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: environments/${{ needs.resolve-context.outputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.base_ref || github.ref }}
+
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+
+          for name in AWS_REGION ROLE_TO_ASSUME TF_STATE_BUCKET; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::$name GitHub variable is required."
+              exit 1
+            fi
+          done
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Check Terraform formatting
+        working-directory: .
+        run: terraform fmt -check -recursive
+
+      - name: Configure AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ env.PROJECT_NAME }}-${{ env.TF_ENVIRONMENT }}-plan
+          mask-aws-account-id: true
+
+      - name: Initialize Terraform
+        run: |
+          set -euo pipefail
+
+          terraform init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${PROJECT_NAME}/${TF_ENVIRONMENT}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Validate Terraform
+        run: terraform validate -no-color
+
+      - name: Create Terraform plan
+        run: |
+          set -euo pipefail
+
+          terraform plan \
+            -input=false \
+            -no-color \
+            -lock-timeout=5m \
+            -var-file="${TF_ENVIRONMENT}.tfvars" \
+            -out=tfplan \
+            | tee terraform-plan.txt
+
+      - name: Add plan to workflow summary
+        if: always()
+        run: |
+          {
+            echo "### Terraform plan: ${TF_ENVIRONMENT}"
+            echo
+            echo '```text'
+            tail -n 200 terraform-plan.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The lock file travels with the plan so the apply job installs the
+      # exact provider version the plan was created with.
+      - name: Upload Terraform plan
+        if: ${{ needs.resolve-context.outputs.should_apply == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ env.TF_ENVIRONMENT }}-${{ github.run_id }}
+          path: |
+            environments/${{ env.TF_ENVIRONMENT }}/tfplan
+            environments/${{ env.TF_ENVIRONMENT }}/.terraform.lock.hcl
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  terraform-apply:
+    name: Terraform apply - ${{ needs.resolve-context.outputs.environment }}
+    runs-on: ubuntu-latest
+
+    needs:
+      - resolve-context
+      - terraform-plan
+
+    if: ${{ needs.resolve-context.outputs.should_apply == 'true' }}
+
+    # The "prod" environment must have required reviewers configured in the
+    # repository settings; the job pauses here until one of them approves.
+    environment:
+      name: ${{ needs.resolve-context.outputs.environment }}
+
+    env:
+      TF_ENVIRONMENT: ${{ needs.resolve-context.outputs.environment }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: environments/${{ needs.resolve-context.outputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.base_ref || github.ref }}
+
+      - name: Download Terraform plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ env.TF_ENVIRONMENT }}-${{ github.run_id }}
+          path: environments/${{ env.TF_ENVIRONMENT }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ env.PROJECT_NAME }}-${{ env.TF_ENVIRONMENT }}-apply
+          mask-aws-account-id: true
+
+      - name: Initialize Terraform
+        run: |
+          set -euo pipefail
+
+          terraform init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${PROJECT_NAME}/${TF_ENVIRONMENT}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Apply Terraform plan
+        run: |
+          set -euo pipefail
+
+          terraform apply \
+            -input=false \
+            -lock-timeout=5m \
+            tfplan
