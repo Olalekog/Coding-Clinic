@@ -38,11 +38,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_REGION: ${{ vars.AWS_REGION }}
   ROLE_TO_ASSUME: ${{ vars.ROLE_TO_ASSUME }}
   TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
   TERRAFORM_VERSION: ${{ vars.TERRAFORM_VERSION || '1.10.4' }}
-  PROJECT_NAME: coding-clinic-vpc
+  PROJECT_NAME: ${{ vars.PROJECT_NAME }}
   TF_IN_AUTOMATION: "true"
 
 jobs:
@@ -143,7 +144,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for name in AWS_REGION ROLE_TO_ASSUME TF_STATE_BUCKET; do
+          for name in AWS_ACCOUNT_ID AWS_REGION PROJECT_NAME ROLE_TO_ASSUME TF_STATE_BUCKET; do
             if [[ -z "${!name}" ]]; then
               echo "::error::$name GitHub variable is required."
               exit 1
@@ -165,6 +166,7 @@ jobs:
         with:
           role-to-assume: ${{ env.ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
           role-session-name: ${{ env.PROJECT_NAME }}-${{ env.TF_ENVIRONMENT }}-plan
           mask-aws-account-id: true
 
@@ -264,6 +266,7 @@ jobs:
         with:
           role-to-assume: ${{ env.ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
           role-session-name: ${{ env.PROJECT_NAME }}-${{ env.TF_ENVIRONMENT }}-apply
           mask-aws-account-id: true
 
